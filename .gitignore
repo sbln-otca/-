@@ -4,4 +4,5 @@ obj/
 *.suo
 *.userprefs
 .vs/
+BattleshipLab3/battle_log_*.json
 

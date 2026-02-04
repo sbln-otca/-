@@ -9,6 +9,9 @@ public partial class Form1 : Form
     private readonly Button[,] _playerButtons = new Button[Board.Size, Board.Size];
     private readonly Button[,] _enemyButtons = new Button[Board.Size, Board.Size];
 
+    // Что мы уже знаем о поле противника
+    private readonly CellState[,] _enemyKnown = new CellState[Board.Size, Board.Size];
+
     private GameState? _gameState;
     private NetworkSession? _session;
 
@@ -140,6 +143,14 @@ public partial class Form1 : Form
 
         var (x, y) = coords;
 
+        // Уже стреляли в эту клетку – повторно не даём
+        if (_enemyKnown[x, y] == CellState.Miss ||
+            _enemyKnown[x, y] == CellState.Hit ||
+            _enemyKnown[x, y] == CellState.Sunk)
+        {
+            return;
+        }
+
         await _session.SendAsync(new NetworkMessage
         {
             Type = MessageType.Shot,
@@ -148,6 +159,9 @@ public partial class Form1 : Form
         });
 
         _gameState.Logger.Add("Me", x, y, "Shot");
+
+        // Больше нельзя стрелять в эту клетку
+        button.Enabled = false;
 
         _gameState.SetPhase(GamePhase.EnemyTurn);
         UpdateStatusText();
@@ -257,17 +271,37 @@ public partial class Form1 : Form
         var result = _gameState.MyBoard.ShootAt(x, y);
         RedrawBoards();
 
+        bool allMyShipsSunk = _gameState.MyBoard.AllShipsSunk();
+
+        // Формируем список клеток, которые противник теперь точно знает как пустые
+        List<CellUpdate>? visibleCells = null;
+        if (result.HaloCells.Count > 0)
+        {
+            visibleCells = new List<CellUpdate>();
+            foreach (var (hx, hy) in result.HaloCells)
+            {
+                visibleCells.Add(new CellUpdate
+                {
+                    X = hx,
+                    Y = hy,
+                    State = CellState.Miss.ToString()
+                });
+            }
+        }
+
         await _session.SendAsync(new NetworkMessage
         {
             Type = MessageType.ShotResult,
             X = x,
             Y = y,
-            Outcome = result.Outcome.ToString()
+            Outcome = result.Outcome.ToString(),
+            AllSunk = allMyShipsSunk,
+            Cells = visibleCells
         });
 
         _gameState.Logger.Add("Enemy", x, y, result.Outcome.ToString());
 
-        if (_gameState.MyBoard.AllShipsSunk())
+        if (allMyShipsSunk)
         {
             _gameState.FinishGame();
             lblStatus.Text = "Поражение";
@@ -303,7 +337,7 @@ public partial class Form1 : Form
         if (!Enum.TryParse<ShotOutcome>(message.Outcome, out var outcome))
             return;
 
-        var current = _gameState.EnemyBoard[x, y];
+        var current = _enemyKnown[x, y];
         switch (outcome)
         {
             case ShotOutcome.Miss:
@@ -328,7 +362,25 @@ public partial class Form1 : Form
                 break;
         }
 
-        if (_gameState.EnemyBoard.AllShipsSunk())
+        // Соперник может дополнительно прислать список клеток вокруг
+        // потопленного корабля, которые точно пустые (ореол).
+        if (message.Cells != null)
+        {
+            foreach (var cell in message.Cells)
+            {
+                if (cell.X < 0 || cell.X >= Board.Size || cell.Y < 0 || cell.Y >= Board.Size)
+                    continue;
+
+                if (Enum.TryParse<CellState>(cell.State, out var state) && state == CellState.Miss)
+                {
+                    SetEnemyCellState(cell.X, cell.Y, CellState.Miss);
+                }
+            }
+        }
+
+        // Победа наступает ТОЛЬКО тогда, когда соперник сообщил,
+        // что после нашего выстрела у него не осталось кораблей.
+        if (message.AllSunk == true)
         {
             _gameState.FinishGame();
             enemyGrid.Enabled = false;
@@ -343,6 +395,8 @@ public partial class Form1 : Form
     private void SetEnemyCellState(int x, int y, CellState state)
     {
         var button = _enemyButtons[x, y];
+        _enemyKnown[x, y] = state;
+
         button.BackColor = state switch
         {
             CellState.Miss => Color.LightGray,
